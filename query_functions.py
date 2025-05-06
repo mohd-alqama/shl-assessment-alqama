@@ -4,12 +4,13 @@ import pandas as pd
 import re
 from bs4 import BeautifulSoup
 import requests
-from sentence_transformers import SentenceTransformer,util
-import torch
-import google.generativeai as genai
 from dotenv import load_dotenv
 import os
+import torch
+import google.generativeai as genai
+from sentence_transformers import SentenceTransformer, util
 
+# Load SHL catalog
 catalog_df = pd.read_csv("SHL_catalog.csv")
 
 def combine_row(row):
@@ -24,37 +25,32 @@ def combine_row(row):
     ]
     return ' '.join(parts)
 
-catalog_df['combined'] = catalog_df.apply(combine_row,axis=1)
-
+catalog_df['combined'] = catalog_df.apply(combine_row, axis=1)
 corpus = catalog_df['combined'].tolist()
-
-model = SentenceTransformer('all-MiniLM-L6-v2')
-
-corpus_embeddings = model.encode(corpus,convert_to_tensor=True)
 
 def extract_url_from_text(text):
     match = re.search(r'(https?://[^\s,]+)', text)
-    if match:
-        return match.group(1)
-    return None
+    return match.group(1) if match else None
 
 def extract_text_from_url(url):
     try:
-        response = requests.get(url,headers={'User-Agent':"Mozilla/5.0"})
-        soup = BeautifulSoup(response.text,'html.parser')
+        response = requests.get(url, headers={'User-Agent': "Mozilla/5.0"})
+        soup = BeautifulSoup(response.text, 'html.parser')
         return ' '.join(soup.get_text().split())
     except Exception as e:
-        return f"Error:{e}"
+        return f"Error: {e}"
 
-load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
+def convert_numpy(obj):
+    if isinstance(obj, (np.integer, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.ndarray,)):
+        return obj.tolist()
+    else:
+        raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-
-genai.configure(api_key=api_key)
-
-gemini_model = genai.GenerativeModel("gemini-1.5-pro")
-
-def extract_features_with_llm(user_query):
+def extract_features_with_llm(user_query, gemini_model):
     prompt = f"""
 You are an intelligent assistant helping to recommend SHL assessments.
 
@@ -86,15 +82,14 @@ Input:
 
 Only return the final, clean sentence — no explanations.
 """
-
     response = gemini_model.generate_content(prompt)
     return response.text.strip()
 
-def find_assessments(user_query,k=5):
-    query_embedding = model.encode(user_query, convert_to_tensor = True)
-    cosine_scores = util.cos_sim(query_embedding,corpus_embeddings)[0]
-    top_k = min(k,len(corpus))
-    top_results = torch.topk(cosine_scores,k=top_k)
+def find_assessments(user_query, model, corpus_embeddings, corpus, catalog_df, k=5):
+    query_embedding = model.encode(user_query, convert_to_tensor=True)
+    cosine_scores = util.cos_sim(query_embedding, corpus_embeddings)[0]
+    top_k = min(k, len(corpus))
+    top_results = torch.topk(cosine_scores, k=top_k)
     results = []
     for score, idx in zip(top_results[0], top_results[1]):
         idx = idx.item()
@@ -112,17 +107,7 @@ def find_assessments(user_query,k=5):
         results.append(result)
     return results
 
-def convert_numpy(obj):
-    if isinstance(obj, (np.integer, np.int64)):
-        return int(obj)
-    elif isinstance(obj, (np.floating, np.float64)):
-        return float(obj)
-    elif isinstance(obj, (np.ndarray,)):
-        return obj.tolist()
-    else:
-        raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
-
-def filter_relevant_assessments_with_llm(user_query, top_results):
+def filter_relevant_assessments_with_llm(user_query, top_results, gemini_model):
     prompt = f"""
 You are helping to refine assessment recommendations based on user needs.
 
@@ -160,54 +145,39 @@ Respond in clean JSON format:
 Assessments:
 {top_results}
 """
-
     response = gemini_model.generate_content(prompt)
     return response.text.strip()
 
-def query_handling_using_LLM_updated(query, model = model , gemini_model = gemini_model, catalog_df = catalog_df, corpus = corpus, corpus_embeddings = corpus_embeddings):
-    url = extract_url_from_text(query)
+def query_handling_using_LLM_updated(query):
+    # Lazy-load models
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    corpus_embeddings = model.encode(corpus, convert_to_tensor=True)
 
+    # LLM API setup
+    load_dotenv()
+    api_key = os.getenv("GEMINI_API_KEY")
+    genai.configure(api_key=api_key)
+    gemini_model = genai.GenerativeModel("gemini-1.5-pro")
+
+    url = extract_url_from_text(query)
     if url:
         extracted_text = extract_text_from_url(url)
         query += " " + extracted_text
 
-    user_query = extract_features_with_llm(query)
-
-    top_results = find_assessments(user_query, k=10)
-
+    user_query = extract_features_with_llm(query, gemini_model)
+    top_results = find_assessments(user_query, model, corpus_embeddings, corpus, catalog_df, k=10)
     top_json = json.dumps(top_results, indent=2, default=convert_numpy)
+    filtered_output = filter_relevant_assessments_with_llm(user_query, top_json, gemini_model)
 
-    filtered_output = filter_relevant_assessments_with_llm(user_query, top_json)
-
-    # Check for empty response
-    if not filtered_output or not filtered_output.strip():
-        print("Empty response from LLM.")
-        return pd.DataFrame()
-
-    # Try to extract valid JSON from the output using regex
+    # JSON parse
     try:
         match = re.search(r"\[.*\]", filtered_output, re.DOTALL)
         if match:
             json_str = match.group()
             filtered_results = json.loads(json_str)
         else:
-            print("⚠️ No valid JSON array found in the response:")
-            print(filtered_output)
             return pd.DataFrame()
-    except json.JSONDecodeError as e:
-        print("JSON Decode Error:", e)
-        print("Raw output was:\n", filtered_output)
+    except json.JSONDecodeError:
         return pd.DataFrame()
 
-    # Convert to DataFrame
-    if not filtered_results:
-        return pd.DataFrame()
-    else:
-        try:
-            df = pd.DataFrame(filtered_results)
-            print("Returning DataFrame:\n", df.head())
-            return df
-        except Exception as e:
-            print("Error creating DataFrame:", e)
-            return pd.DataFrame()
-
+    return pd.DataFrame(filtered_results)
